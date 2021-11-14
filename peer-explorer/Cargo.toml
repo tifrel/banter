@@ -1,0 +1,13 @@
+[package]
+name = "banter-peer-explorer"
+version = "0.1.0"
+edition = "2018"
+
+[[bin]]
+name = "banter-peer-explorer"
+path = "main.rs"
+
+[dependencies]
+banter = { path = "../lib" }
+clap = "2.33.3"
+tokio = { version = "1.13.0", features = ["full"] }
