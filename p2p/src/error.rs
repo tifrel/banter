@@ -11,6 +11,8 @@ pub enum Error {
     ConnectionFailed { to: String },
     /// Writing to TCP socket failed
     SocketWriteFailed { to: String },
+    /// Failed trying to decode a non-base64 string as base64
+    Base64Decode { string: String },
 }
 
 impl<T> Into<Result<T, Error>> for Error {
@@ -28,8 +30,17 @@ impl fmt::Display for Error {
             Parsing { from, to } => {
                 write!(f, "Error while trying to parse {} as {}", from, to)
             }
-            ConnectionFailed { to } => write!(f, "Connection failed to: {}", to),
-            SocketWriteFailed { to } => write!(f, "Writing to socket failed: {}", to),
+            ConnectionFailed { to } => {
+                write!(f, "Connection failed to: {}", to)
+            }
+            SocketWriteFailed { to } => {
+                write!(f, "Writing to socket failed: {}", to)
+            }
+            Base64Decode { string } => write!(
+                f,
+                "Failed to decode non-base64 string as base64: {}",
+                string
+            ),
         }
     }
 }

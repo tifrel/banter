@@ -8,6 +8,6 @@ name = "banter-peer-explorer"
 path = "main.rs"
 
 [dependencies]
-banter = { path = "../lib" }
+banter_p2p = { path = "../p2p" }
 clap = "2.33.3"
 tokio = { version = "1.13.0", features = ["full"] }

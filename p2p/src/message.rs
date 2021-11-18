@@ -14,7 +14,7 @@ pub enum P2pMsg {
     /// connection. The first field is the sender of the message, the second
     /// a serial for this requeslt, and the third the peer whose heartbeat is
     /// requested.
-    RequestHeartbeat (Peer, u64, Peer),
+    RequestHeartbeat(Peer, u64, Peer),
     /// Request a peerlist to update mine, used while building the initial
     /// network connection.
     RequestPeerlist(Peer),
@@ -36,7 +36,7 @@ impl Into<BytesMut> for P2pMsg {
                 peer.write_to_bytes(&mut buffer);
             }
             RequestHeartbeat(from, serial, to) => {
-            buffer.put_u8(2);
+                buffer.put_u8(2);
                 from.write_to_bytes(&mut buffer);
                 buffer.put_u64(serial);
                 to.write_to_bytes(&mut buffer);
@@ -78,14 +78,15 @@ impl TryFrom<BytesMut> for P2pMsg {
             1 if remaining == PEER_BYTES_LEN => {
                 Peer::read_from_bytes(&mut bytes).map(|peer| Heartbeat(peer))
             }
-            2 if remaining == PEER_BYTES_LEN => {
+            2 if remaining == PEER_BYTES_LEN * 2 + 8 => {
                 let from = Peer::read_from_bytes(&mut bytes)?;
                 let serial = bytes.get_u64();
                 let to = Peer::read_from_bytes(&mut bytes)?;
                 Ok(Self::RequestHeartbeat(from, serial, to))
             }
             3 if remaining == PEER_BYTES_LEN => {
-                Peer::read_from_bytes(&mut bytes).map(|peer| RequestPeerlist(peer))
+                Peer::read_from_bytes(&mut bytes)
+                    .map(|peer| RequestPeerlist(peer))
             }
             4 if remaining % PEER_BYTES_LEN == 0 => {
                 let mut peers = Vec::new();
@@ -111,15 +112,19 @@ mod tests {
     use P2pMsg::*;
     #[test]
     fn p2pmsg_serde() {
-        let self_peer = Peer::from_socket([127, 0, 0, 1], 12000);
+        let self_peer = Peer::from_socket_random_id([127, 0, 0, 1], 12000);
         let messages = [
             Heartbeat(self_peer),
-            // RequestHeartbeat(self_peer),
+            RequestHeartbeat(
+                self_peer,
+                0,
+                Peer::from_socket_random_id([3, 141, 59, 26], 53589),
+            ),
             RequestPeerlist(self_peer),
             Peerlist(vec![
-                Peer::from_socket([127, 0, 0, 1], 12001),
-                Peer::from_socket([127, 0, 0, 1], 12002),
-                Peer::from_socket([127, 0, 0, 1], 12003),
+                Peer::from_socket_random_id([127, 0, 0, 1], 12001),
+                Peer::from_socket_random_id([127, 0, 0, 1], 12002),
+                Peer::from_socket_random_id([127, 0, 0, 1], 12003),
             ]),
             Data(self_peer, 0, "Hello, World!".into()),
         ];

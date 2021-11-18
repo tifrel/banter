@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "p2p",
   "lib",
   "node",
   "peer-explorer",

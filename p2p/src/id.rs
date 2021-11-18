@@ -3,6 +3,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::{
     convert::{AsRef, From, Into},
     fmt,
+    str::FromStr,
 };
 
 /// Holds a unique ID for each Peer. Designed to be drawn at random, as there
@@ -11,6 +12,12 @@ use std::{
 pub struct PeerId([u8; 18]);
 
 impl PeerId {
+    /// Generates a new empty peer ID.
+    #[inline]
+    pub fn empty() -> Self {
+        Self([0; 18])
+    }
+
     /// Generates a new random peer ID. This has to initialize a RNG internally,
     /// so for generation of many IDs, `PeerId::by_rng` is preferable.
     pub fn random() -> Self {
@@ -63,9 +70,26 @@ impl From<[u8; 18]> for PeerId {
     }
 }
 
+impl FromStr for PeerId {
+    type Err = Error;
+    fn from_str(string: &str) -> Result<Self, Self::Err> {
+        let id_vec = util::base64_decode(string)?;
+        if id_vec.len() != 18 {
+            Err(Error::Parsing {
+                from: string.to_string(),
+                to: "PeerId".to_string(),
+            })
+        } else {
+            let mut id = [0; 18];
+            id.copy_from_slice(&id_vec[..]);
+            Ok(Self(id))
+        }
+    }
+}
+
 impl fmt::Display for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", &util::format_base64(self.as_ref()))
+        write!(f, "{}", &util::base64_encode(self.as_ref()))
     }
 }
 

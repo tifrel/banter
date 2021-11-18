@@ -1,13 +1,21 @@
-use crate::{Error, P2pMsg, Peer, PEER_BYTES_LEN};
-use bytes::{Bytes, BytesMut, BufMut};
-use std::{collections::HashMap, convert::{Into, TryFrom}, sync::{Arc, Mutex}};
+use crate::{Error, P2pMsg, Peer, PeerId, PEER_BYTES_LEN};
+use bytes::{Bytes, BytesMut};
+use std::{
+    collections::HashMap,
+    convert::{Into, TryFrom},
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::mpsc::{self, Receiver, Sender},
     time,
 };
 
+/// A handler for the p2p communication. Handles network broadcasting, and
+/// updates itself with recently encountered peers.
+/// This is the translation layer between the `P2pMsg` type in Rust and the
+/// language-agnostic raw bytes that are transferred via TCP/IP.
 #[derive(Debug)]
 pub struct Peerlist {
     task: tokio::task::JoinHandle<()>,
@@ -17,7 +25,9 @@ pub struct Peerlist {
 /// Options required for creating a peerlist
 pub struct PeerlistOptions {
     /// The socket address (IPv4 and port) that this node should bind to.
-    pub my_addr: String,
+    pub addr: String,
+    /// The ID that this node will use.
+    pub id: PeerId,
     /// Peers that the list will try to contact upon initialization.
     /// To connect to any network, at least one of these peers is required to
     /// respond.
@@ -41,31 +51,37 @@ pub struct PeerlistOptions {
     pub init_serial: u64,
     /// Sife of the internal buffer to read messages. As of now, messages that
     /// exceed this size will cause a panic.
-    pub buffer_size: usize
+    pub buffer_size: usize,
 }
 
 impl Peerlist {
     /// Create a new Peerlist that handles connections to the network.
-    pub fn new(opts: PeerlistOptions) -> Result<(Self, mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>), Error> {
+    ///
+    /// If successful, returns the Peerlist handle itself, a sender for data
+    /// (anything sent into this will be broadcasted to the network), and a
+    /// receiver for any messages incoming from the network.
+    pub fn new(
+        opts: PeerlistOptions,
+    ) -> Result<(Self, Sender<Bytes>, Receiver<(Peer, Bytes)>), Error> {
         let (tx_external, rx_external) = mpsc::channel(128);
         let (tx_internal, mut rx_internal) = mpsc::channel(128);
-        let self_peer = Peer::try_from_socket_str(&opts.my_addr)?;
+        let self_peer = Peer::try_from_socket_str(opts.id, &opts.addr)?;
         let peers = Arc::new(Mutex::new([None; 128]));
         let task_peers = peers.clone();
 
         let task = tokio::spawn(async move {
-            let listener = TcpListener::bind(&opts.my_addr).await.unwrap();
-            println!("Listening on TCP socket");
+            let listener = TcpListener::bind(&opts.addr).await.unwrap();
 
             // initial heartbeat + request peerlist
             for peer in opts.init_peers.iter() {
-                let peer = Peer::try_from_socket_str(peer).unwrap();
+                let peer = Peer::try_from_socket_str_empty_id(peer).unwrap();
                 let _ = peer.send(P2pMsg::Heartbeat(self_peer).into()).await;
-                let _ = peer.send(P2pMsg::RequestPeerlist(self_peer).into()).await;
+                let _ =
+                    peer.send(P2pMsg::RequestPeerlist(self_peer).into()).await;
             }
 
-            let mut state = PeerlistState::new(task_peers, self_peer, tx_external, opts);
-
+            let mut state =
+                PeerlistState::new(task_peers, self_peer, tx_external, opts);
             loop {
                 let sleep = time::sleep_until(state.next_heartbeat);
                 tokio::select! {
@@ -74,11 +90,14 @@ impl Peerlist {
                             state.handle_connection(socket).await;
                         }
                     }
-                    _ = sleep => {
-                        state.broadcast_heartbeat().await;
-                    }
+
+                    _ = sleep => { state.broadcast_heartbeat().await; }
+
                     Some(data) = rx_internal.recv() => {
-                        state.broadcast_data(data).await;
+                        state.broadcast_bytes(
+                            P2pMsg::Data(state.peer, state.serial, data).into()
+                        ).await;
+                        state.serial += 1;
                     }
                 }
             }
@@ -88,14 +107,16 @@ impl Peerlist {
     }
 
     pub fn get_peers(&self) -> Peers {
-        Peers {list: self.peers.clone(), i: 0}
+        Peers {
+            list: self.peers.clone(),
+            i: 0,
+        }
     }
 }
 
 // Holds the state and is used in (and thus moved into) the async block.
-// Only the actual list is shared with
-// TODO: To allow logging in with my "credentials", we need to store they id,
-// and the serials. Storing peers might be a healthy idea for reconnecting.
+// TODO: To allow logging in with my "credentials", we need to store the id,
+// and my serial. Storing peers might be a healthy idea for reconnecting.
 struct PeerlistState {
     peer: Peer,
     serial: u64,
@@ -107,15 +128,18 @@ struct PeerlistState {
     heartbeat_min: time::Duration,
     heartbeat_avg: time::Duration,
     heartbeat_max: time::Duration,
-    tx_external: mpsc::Sender<Bytes>,
+    tx_external: Sender<(Peer, Bytes)>,
 }
 
 impl PeerlistState {
-    fn new(peers: Arc<Mutex<[Option<Peer>; 128]>>, self_peer: Peer, tx_external: mpsc::Sender<Bytes>, opts: PeerlistOptions) -> Self {
+    fn new(
+        peers: Arc<Mutex<[Option<Peer>; 128]>>,
+        self_peer: Peer,
+        tx_external: Sender<(Peer, Bytes)>,
+        opts: PeerlistOptions,
+    ) -> Self {
         let mut buffer = BytesMut::with_capacity(opts.buffer_size);
         buffer.resize(opts.buffer_size, 0);
-        // let heartbeat_min = time::Duration::from_millis(opts.heartbeat_min);
-        // let heartbeat_max = time::Duration::from_millis(opts.heartbeat_avg);
         let last_heartbeat = time::Instant::now();
         let next_heartbeat = last_heartbeat + opts.heartbeat_avg;
 
@@ -134,13 +158,13 @@ impl PeerlistState {
         }
     }
 
-    fn as_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(128 * PEER_BYTES_LEN);
-        for peer in self.peers() {
-            peer.write_to_bytes(&mut bytes);
-        }
-        bytes.into()
-    }
+    // fn as_bytes(&self) -> Bytes {
+    //     let mut bytes = BytesMut::with_capacity(128 * PEER_BYTES_LEN);
+    //     for peer in self.peers() {
+    //         peer.write_to_bytes(&mut bytes);
+    //     }
+    //     bytes.into()
+    // }
 
     fn insert(&mut self, peer: Peer) {
         let i = peer.id.as_ref()[17] % 128;
@@ -148,42 +172,19 @@ impl PeerlistState {
         peers[i as usize] = Some(peer);
     }
 
+    #[inline]
     fn peers(&self) -> Peers {
-        Peers { list: self.peers.clone(), i: 0 }
+        Peers {
+            list: self.peers.clone(),
+            i: 0,
+        }
     }
 
     // --------------------- impls for messages from peers ---------------------
-
-    // // Capped by the buffer
-    // async fn read_socket(&mut self, mut socket: TcpStream) -> Option<(usize, BytesMut)> {
-    //     match socket.read(&mut self.buffer).await {
-    //         Ok(n) => Some((n, BytesMut::from(&self.buffer[..n]))),
-    //         Err(_) => None,
-    //     }
-    // }
-
-    // // Reading into vec
-    // async fn read_socket(&mut self, mut socket: TcpStream) -> Option<(usize, BytesMut)> {
-    //     let mut total = 0;
-    //     let mut bytes = BytesMut::new();
-    //     loop {
-    //         match socket.read(&mut self.buffer).await {
-    //             Ok(n) => {
-    //                 bytes.resize(n, 0);
-    //                 bytes.copy_from_slice(&mut self.buffer[..n]);
-    //                 total += n;
-    //                 if n == 0 {
-    //                     break;
-    //                 }
-    //             }
-    //             Err(_) => return None,
-    //         }
-    //     }
-    //     Some((total, bytes))
-    // }
-
     async fn handle_connection(&mut self, mut socket: TcpStream) {
-        // TODO: use vec instead of buffer?
+        // (maybe) TODO: use vec instead of buffer?
+        // pro: allows arbitrary length messages
+        // con: might be abused by an attacker
         let (n, buffer) = match socket.read(&mut self.buffer).await {
             Ok(n) => (n, BytesMut::from(&self.buffer[..n])),
             Err(_) => return,
@@ -192,25 +193,46 @@ impl PeerlistState {
         if let Ok(msg) = P2pMsg::try_from(buffer) {
             use P2pMsg::*;
             match msg {
-                Heartbeat(peer) if n == 1 + PEER_BYTES_LEN => self.handle_heartbeat(peer).await,
-                RequestHeartbeat(from, serial, to) if n == 1 + PEER_BYTES_LEN => {
-                    self.handle_heartbeat_request(from, serial, to).await
+                Heartbeat(peer) if n == 1 + PEER_BYTES_LEN => {
+                    self.handle_heartbeat(peer).await;
                 }
+
+                RequestHeartbeat(from, serial, to)
+                    if n == 1 + PEER_BYTES_LEN =>
+                {
+                    self.handle_heartbeat_request(from, serial, to).await;
+                }
+
                 RequestPeerlist(peer) if n == 1 + PEER_BYTES_LEN => {
-                    self.handle_peerlist_request(peer).await
+                    self.handle_peerlist_request(peer).await;
                 }
-                Peerlist(peers) => self.handle_peerlist(peers).await,
-                Data(peer, serial, data) => self.handle_data(peer, serial, data).await,
-                _ => {}
+
+                Peerlist(peers) => {
+                    self.handle_peerlist(peers).await;
+                }
+
+                Data(peer, serial, data) => {
+                    self.handle_data(peer, serial, data).await;
+                }
+
+                _ => { /*Nothing, we don't bother ourselves with rubbish*/ }
             }
         }
     }
 
-    async fn handle_heartbeat_request(&mut self, from: Peer, serial: u64,to: Peer) {
+    async fn handle_heartbeat_request(
+        &mut self,
+        from: Peer,
+        serial: u64,
+        to: Peer,
+    ) {
         if to == self.peer {
             let _ = from.send(P2pMsg::Heartbeat(self.peer).into()).await;
         } else if serial > *self.serials.entry(from).or_insert(0) {
-            self.broadcast_bytes(P2pMsg::RequestHeartbeat(from, serial, to).into()).await;
+            self.broadcast_bytes(
+                P2pMsg::RequestHeartbeat(from, serial, to).into(),
+            )
+            .await;
         }
     }
 
@@ -221,19 +243,24 @@ impl PeerlistState {
     }
 
     async fn handle_peerlist_request(&mut self, peer: Peer) {
-        let _ = peer.send(self.as_bytes()).await;
+        let msg = P2pMsg::Peerlist(self.peers().collect());
+        let _ = peer.send(msg.into()).await;
     }
 
     async fn handle_peerlist(&mut self, peers: Vec<Peer>) {
         for peer in peers {
-            self.insert(peer);
+            if peer.id != self.peer.id {
+                self.insert(peer);
+            }
         }
     }
 
     async fn handle_data(&mut self, peer: Peer, serial: u64, data: Bytes) {
-        if serial > *self.serials.entry(peer).or_insert(0) {
-            self.serials.insert(peer, serial);
-            self.tx_external.send(data).await.unwrap();
+        if serial >= *self.serials.entry(peer).or_insert(0) {
+            self.serials.insert(peer, serial + 1);
+            self.tx_external.send((peer, data.clone())).await.unwrap();
+            self.broadcast_bytes(P2pMsg::Data(peer, serial, data).into())
+                .await;
         }
     }
 
@@ -251,8 +278,13 @@ impl PeerlistState {
             let mut peers = self.peers.lock().unwrap();
             let criterion = time::Instant::now() - self.heartbeat_max;
             for (i, peer) in peers.clone().iter().enumerate() {
-                if let Some(Peer {id: _, addr: _, last_heartbeat: Some(last)}) = peer {
-                    if *last < criterion  {
+                if let Some(Peer {
+                    id: _,
+                    addr: _,
+                    last_heartbeat: Some(last),
+                }) = peer
+                {
+                    if *last < criterion {
                         peers[i] = None;
                     }
                 }
@@ -264,14 +296,6 @@ impl PeerlistState {
         for peer in self.peers() {
             let _ = peer.send(bytes.clone()).await;
         }
-    }
-
-    async fn broadcast_data(&mut self, bytes: Bytes) {
-        let mut buffer = BytesMut::new();
-        buffer.put_u64(self.serial);
-        self.serial += 1;
-        buffer.copy_from_slice(bytes.as_ref());
-        self.broadcast_bytes(buffer.into()).await
     }
 }
 
